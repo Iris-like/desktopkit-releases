@@ -98,6 +98,7 @@ jobs:
         env:
           MAC_CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
           MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_SIGNING_IDENTITY: ${{ secrets.MAC_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           # secrets 上下文在 if 里不可用，只能在 step 内部判断。
@@ -118,7 +119,21 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/cert.p12"
 
-          wails3 task darwin:sign
+          # 签名身份：优先用 secret 里显式给的，否则从 keychain 里找 Developer ID
+          if [ -z "${MAC_SIGNING_IDENTITY:-}" ]; then
+            MAC_SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+              | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)
+          fi
+          if [ -z "$MAC_SIGNING_IDENTITY" ]; then
+            echo "::error::keychain 里没有 Developer ID Application 证书"
+            exit 1
+          fi
+          echo "签名身份: $MAC_SIGNING_IDENTITY"
+
+          # 传给后续步骤（dmg 也要签）
+          echo "IDENTITY=$MAC_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+          wails3 task darwin:sign -- --identity "$MAC_SIGNING_IDENTITY"
 
       - name: Package zip and dmg
         working-directory: src
@@ -139,9 +154,36 @@ jobs:
           [ "$c" = "0" ] || { echo "::error::zip 含 $c 个 ._ 文件"; exit 1; }
 
           # 2) 安装包：dmg，给首次安装用（用户在 Finder 里拖进 Applications）
-          # Wails 自带 package:dmg，含背景图与 Applications 链接
-          wails3 task darwin:package:dmg
-          mv "bin/desktopkit.dmg" "dist/desktopkit_${VERSION}_${{ matrix.arch }}.dmg"
+          #
+          # 用 hdiutil 直接做，不用 wails3 task darwin:package:dmg：
+          # 后者会套上模板自带的渐变背景、卷图标和 WAILS 水印，是 Wails 的
+          # 品牌资源，不是我们的。朴素外观反而更像正经的 macOS 安装包。
+          # 做法照 magpie：只放 .app 和 Applications 链接。
+          DMG="dist/desktopkit_${VERSION}_${{ matrix.arch }}.dmg"
+          stage="$RUNNER_TEMP/dmg"
+          rm -rf "$stage" && mkdir -p "$stage"
+          cp -R "bin/desktopkit.app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+
+          # 显式给镜像大小，不让 hdiutil 从目录猜。
+          # magpie 的记录：Intel runner 上猜出来的偏小，每次都在
+          # 「No space left on device」失败（v0.1.1911、1913、1915、1918、1921）
+          SIZE=$(( $(du -sm "$stage" | cut -f1) * 5 / 4 + 32 ))m
+
+          # Intel runner 偶发 "create failed - Resource busy"，重试 5 次
+          for try in 1 2 3 4 5; do
+            hdiutil create -volname desktopkit -srcfolder "$stage" -size "$SIZE" \
+              -ov -format UDZO "$DMG" && break
+            [ "$try" = 5 ] && { echo "::error::hdiutil create 失败 5 次"; exit 1; }
+            echo "hdiutil create 失败（第 $try 次），重试"
+            rm -f "$DMG"
+            sleep $((try * 10))
+          done
+
+          # 配了证书就给 dmg 本身签名（公证另做，见 PIPELINE.md 第 5 节）
+          if [ -n "${IDENTITY:-}" ]; then
+            codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+          fi
 
           ls -lh dist/
 
