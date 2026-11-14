@@ -1,0 +1,219 @@
+name: desktop-release
+
+# 构建 DesktopKit 桌面应用并发布到本仓库的 Release。
+#
+# 触发：推送 desktop-v* tag。手动触发只构建，不发布。
+#
+# 结构参照 magpie 的双仓库做法：
+#   本仓库（desktopkit-releases）只负责构建、签名、发布
+#   源码来自公开仓库 Iris-like/desktopkit，匿名 checkout，不需要跨仓库 token
+#
+# 产物：
+#   desktopkit-darwin-arm64.zip   macOS Apple Silicon（含 .app）
+#   desktopkit-darwin-amd64.zip   macOS Intel
+#   desktopkit-feed.json          更新 feed（已签名）
+#   SHA256SUMS
+#
+# 必需的 secret：
+#   UPDATE_SIGNING_KEY   ed25519 私钥 PEM，给 feed 签名
+#
+# 可选 secret（配了才做代码签名）：
+#   MAC_CERTIFICATE_P12 / MAC_CERTIFICATE_PASSWORD
+
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号，例如 0.1.0（仅构建，不发布）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Iris-like/desktopkit
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64 }
+          - { arch: amd64 }
+    runs-on: macos-14
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: main
+          path: src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install wails3
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0
+
+      - name: Resolve version
+        run: |
+          RAW="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${RAW#desktop-v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "构建版本 ${VERSION}"
+
+      - name: Sync version into config
+        working-directory: src
+        run: |
+          # build/config.yml 的 info.version 决定 Info.plist，
+          # 必须与 ldflags 注入的 main.appVersion 一致
+          sed -i '' "s/^  version: \".*\"/  version: \"${VERSION}\"/" build/config.yml
+          grep -E '^\s+version:' build/config.yml
+          wails3 task common:update:build-assets
+
+      - name: Build and package
+        working-directory: src
+        run: |
+          # ARCH 是 Wails Taskfile 的变量名，不是 GOARCH。
+          # amd64 在 arm64 runner 上交叉编译。
+          APP_VERSION="${VERSION}" wails3 package ARCH=${{ matrix.arch }}
+          ls -la bin/
+
+      - name: Codesign (optional)
+        working-directory: src
+        env:
+          MAC_CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # secrets 上下文在 if 里不可用，只能在 step 内部判断。
+          # 没有证书时跳过，产出 ad-hoc 签名的包（用户需右键打开）。
+          if [ -z "${MAC_CERTIFICATE_P12:-}" ]; then
+            echo "未配置 MAC_CERTIFICATE_P12，跳过代码签名"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$MAC_CERTIFICATE_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MAC_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k actions "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          wails3 task darwin:sign
+
+      - name: Package zip
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ZIP="dist/desktopkit-darwin-${{ matrix.arch }}.zip"
+          # 必须带 --norsrc --noextattr：否则 zip 里会带 ._ 文件，
+          # 解包后残留在 .app 里导致换包后 codesign 校验失败
+          ditto -c -k --norsrc --noextattr --keepParent "bin/desktopkit.app" "$ZIP"
+
+          # 自检：顶层只能有一个条目，且不含 ._
+          n=$(unzip -Z1 "$ZIP" | cut -d/ -f1 | sort -u | wc -l | tr -d ' ')
+          [ "$n" = "1" ] || { echo "::error::zip 顶层有 $n 个条目，应为 1"; exit 1; }
+          c=$(unzip -Z1 "$ZIP" | grep -c '/\._' || true)
+          [ "$c" = "0" ] || { echo "::error::zip 含 $c 个 ._ 文件"; exit 1; }
+
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.arch }}
+          path: src/dist/desktopkit-darwin-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    # 手动触发只构建，不发布；发布只认 tag
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: main
+          path: src
+
+      - name: Resolve version
+        run: |
+          RAW="${{ github.ref_name }}"
+          echo "VERSION=${RAW#desktop-v}" >> "$GITHUB_ENV"
+          echo "TAG=${RAW}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate signed feed
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$UPDATE_SIGNING_KEY" ] || { echo "::error::缺少 UPDATE_SIGNING_KEY secret"; exit 1; }
+          key="$RUNNER_TEMP/update.key"
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+
+          # 资产 URL 指向本 Release 的下载地址
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          python3 src/scripts/gen-feed.py "$VERSION" "$BASE" dist "$key" dist/desktopkit-feed.json
+
+      - name: Assert assets
+        run: |
+          zips=$(ls dist/*.zip 2>/dev/null | wc -l | tr -d ' ')
+          echo "zips: $zips"
+          [ "$zips" -ge 1 ] || { echo "::error::没有产出任何 zip"; ls -la dist; exit 1; }
+          [ -f dist/SHA256SUMS ] || { echo "::error::缺少 SHA256SUMS"; exit 1; }
+          [ -f dist/desktopkit-feed.json ] || { echo "::error::缺少 feed"; exit 1; }
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "DesktopKit ${VERSION}" \
+            --notes "DesktopKit ${VERSION}
+
+          ## 安装
+          - macOS Apple Silicon: \`desktopkit-darwin-arm64.zip\`
+          - macOS Intel: \`desktopkit-darwin-amd64.zip\`
+
+          解压后把 \`desktopkit.app\` 拖进「应用程序」。
+
+          ## 自动更新
+          客户端读取 \`desktopkit-feed.json\`，无需手动下载。" \
+            --verify-tag \
+            --latest
