@@ -120,14 +120,16 @@ jobs:
 
           wails3 task darwin:sign
 
-      - name: Package zip
+      - name: Package zip and dmg
         working-directory: src
         run: |
           set -euo pipefail
           mkdir -p dist
-          ZIP="dist/desktopkit-darwin-${{ matrix.arch }}.zip"
+
+          # 1) 更新包：只含 .app，给自更新用
           # 必须带 --norsrc --noextattr：否则 zip 里会带 ._ 文件，
           # 解包后残留在 .app 里导致换包后 codesign 校验失败
+          ZIP="dist/desktopkit-darwin-${{ matrix.arch }}.zip"
           ditto -c -k --norsrc --noextattr --keepParent "bin/desktopkit.app" "$ZIP"
 
           # 自检：顶层只能有一个条目，且不含 ._
@@ -136,12 +138,19 @@ jobs:
           c=$(unzip -Z1 "$ZIP" | grep -c '/\._' || true)
           [ "$c" = "0" ] || { echo "::error::zip 含 $c 个 ._ 文件"; exit 1; }
 
+          # 2) 安装包：dmg，给首次安装用（用户在 Finder 里拖进 Applications）
+          # Wails 自带 package:dmg，含背景图与 Applications 链接
+          wails3 task darwin:package:dmg
+          mv "bin/desktopkit.dmg" "dist/desktopkit_${VERSION}_${{ matrix.arch }}.dmg"
+
           ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.arch }}
-          path: src/dist/desktopkit-darwin-${{ matrix.arch }}.zip
+          path: |
+            src/dist/desktopkit-darwin-${{ matrix.arch }}.zip
+            src/dist/desktopkit_*_${{ matrix.arch }}.dmg
           if-no-files-found: error
           retention-days: 1
 
@@ -192,8 +201,10 @@ jobs:
       - name: Assert assets
         run: |
           zips=$(ls dist/*.zip 2>/dev/null | wc -l | tr -d ' ')
-          echo "zips: $zips"
-          [ "$zips" -ge 1 ] || { echo "::error::没有产出任何 zip"; ls -la dist; exit 1; }
+          dmgs=$(ls dist/*.dmg 2>/dev/null | wc -l | tr -d ' ')
+          echo "zips: $zips, dmgs: $dmgs"
+          [ "$zips" -ge 1 ] || { echo "::error::没有产出任何 zip（更新包）"; ls -la dist; exit 1; }
+          [ "$dmgs" -ge 1 ] || { echo "::error::没有产出任何 dmg（安装包）"; ls -la dist; exit 1; }
           [ -f dist/SHA256SUMS ] || { echo "::error::缺少 SHA256SUMS"; exit 1; }
           [ -f dist/desktopkit-feed.json ] || { echo "::error::缺少 feed"; exit 1; }
 
@@ -207,13 +218,22 @@ jobs:
             --title "DesktopKit ${VERSION}" \
             --notes "DesktopKit ${VERSION}
 
-          ## 安装
-          - macOS Apple Silicon: \`desktopkit-darwin-arm64.zip\`
-          - macOS Intel: \`desktopkit-darwin-amd64.zip\`
+          ## 安装（推荐 dmg）
 
-          解压后把 \`desktopkit.app\` 拖进「应用程序」。
+          下载对应架构的 \`.dmg\`，打开后把 \`desktopkit.app\` 拖进「应用程序」。
+
+          - macOS Apple Silicon: \`desktopkit_${VERSION}_arm64.dmg\`
+          - macOS Intel: \`desktopkit_${VERSION}_amd64.dmg\`
+
+          也可以下 \`.zip\` 手动解压：
+
+          - \`desktopkit-darwin-arm64.zip\`
+          - \`desktopkit-darwin-amd64.zip\`
+
+          > 当前未配置 Apple 代码签名，首次打开需右键 → 打开。
 
           ## 自动更新
+
           客户端读取 \`desktopkit-feed.json\`，无需手动下载。" \
             --verify-tag \
             --latest
