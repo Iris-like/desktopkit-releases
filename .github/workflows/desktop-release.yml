@@ -217,3 +217,33 @@ jobs:
           客户端读取 \`desktopkit-feed.json\`，无需手动下载。" \
             --verify-tag \
             --latest
+
+      # 通知源码仓库复制这份 Release，让它的主页也能直接下载。
+      # 用 repository_dispatch 而不是定时轮询：发布完立即镜像，
+      # 不用等下一个整点。需要 PAT（GITHUB_TOKEN 不能跨仓库写）。
+      - name: Notify source repo to mirror
+        env:
+          TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          TAG: ${{ env.TAG }}
+          VERSION: ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::未配置 SOURCE_REPO_TOKEN，跳过镜像通知（源码仓库需手动跑 mirror.yml）"
+            exit 0
+          fi
+          payload=$(jq -nc --arg tag "$TAG" --arg version "$VERSION" \
+            '{event_type: "release-published", client_payload: {tag: $tag, version: $version}}')
+          code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            --data "$payload" \
+            "https://api.github.com/repos/${SOURCE_REPO}/dispatches")
+          if [[ "$code" == 2* ]]; then
+            echo "已通知 ${SOURCE_REPO} 镜像 $TAG（HTTP $code）"
+          else
+            echo "::error::dispatch 失败 HTTP $code"
+            cat /tmp/dispatch.json; echo
+            exit 1
+          fi
